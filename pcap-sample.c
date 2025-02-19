@@ -15,7 +15,7 @@
 //#define _DBG_PKT
 //#define _DBG_ETH
 //#define _DBG_IP
-//#define _DBG_TCP
+#define _DBG_TCP
 #define _DBG_FTP_CTRL
 
 #define FTP_CMD_PORT	"PORT "
@@ -32,10 +32,77 @@ static char ftp_filename[256];
 
 #define FTP_DATA_MODE_PORT	1
 #define FTP_DATA_MODE_PASV	2
+
+typedef struct tcp_segment {
+    __u32 seq;                  // 序列号
+    __u32 len;                  // 数据长度
+    u_char data[65536];         // 数据缓存
+    struct tcp_segment *next;   // 链表指针
+} TcpSegment;
+
+typedef struct tcp_session {
+    __u32 client_ip;           // 客户端 IP
+    __u16 client_port;         // 客户端端口
+    __u32 server_ip;           // 服务器 IP
+    __u16 server_port;         // 服务器端口
+    __u32 next_seq;           // 期望的下一个序列号
+    int syn_received;         // 是否收到 SYN
+    int fin_received;         // 是否收到 FIN
+    TcpSegment *head;         // 数据包链表头
+    FILE *fp;                 // 文件指针
+} TcpSession;
+
 static __u32 ftp_data_mode = 0;
 
 static __u32 ftp_data_listen_ip = 0;
 static __u16 ftp_data_listen_port = 0;
+static TcpSession *current_session = NULL;
+
+TcpSession *create_tcp_session(__u32 cip, __u16 cport, __u32 sip, __u16 sport) {
+    TcpSession *session = (TcpSession *)malloc(sizeof(TcpSession));
+    if (!session) return NULL;
+    
+    memset(session, 0, sizeof(TcpSession));
+    session->client_ip = cip;
+    session->client_port = cport;
+    session->server_ip = sip;
+    session->server_port = sport;
+    session->fp = fopen("cstest.txt", "wb");
+    
+    return session;
+}
+
+void insert_tcp_segment(TcpSession *session, __u32 seq, const u_char *data, __u32 len) {
+    if (!session || !data || !len) return;
+    // 如果是期望的下一个序列号，直接写入文件
+    if (seq == session->next_seq) {
+        fwrite(data, 1, len, session->fp);
+        session->next_seq = seq + len;
+        return;
+    }
+
+    // 否则加入链表
+    TcpSegment *seg = (TcpSegment *)malloc(sizeof(TcpSegment));
+    if (!seg) return;
+
+    seg->seq = seq;
+    seg->len = len;
+    memcpy(seg->data, data, len);
+    
+    // 按序列号排序插入
+    TcpSegment **pp = &session->head;
+    while (*pp && (*pp)->seq < seq) {
+        pp = &(*pp)->next;
+    }
+    
+    if (*pp && (*pp)->seq == seq) {
+        free(seg);
+        return;
+    }
+    
+    seg->next = *pp;
+    *pp = seg;
+}
 
 //transform "a1,a2,a3,a4,a5,a6" to IP and port
 int get_ftp_data_addr(const char *addrstr)
@@ -122,9 +189,9 @@ void tcp_proc(const u_char * tcp_pkt, __u32 pkt_len, __u32 srcip, __u32 dstip)
 
 #ifdef _DBG_TCP
 	DBG("**** TCP Header ****\n");
-	DBG("Source Port: %d\n", ntohs(tcph->source));
-	DBG("Dest   Port: %d\n", ntohs(tcph->dest));
-	DBG("Data Offset: %d (%d bytes)\n", tcph->doff, tcph->doff * 4);
+	// DBG("Source Port: %d\n", ntohs(tcph->source));
+	// DBG("Dest   Port: %d\n", ntohs(tcph->dest));
+	// DBG("Data Offset: %d (%d bytes)\n", tcph->doff, tcph->doff * 4);
 	DBG("SequenceNum: %u\n", ntohl(tcph->seq));
 	DBG("Ack Number : %u\n", ntohl(tcph->ack_seq));
 	DBG("TCP Payload: %u bytes\n", pkt_len - tcph->doff * 4);
@@ -150,7 +217,44 @@ void tcp_proc(const u_char * tcp_pkt, __u32 pkt_len, __u32 srcip, __u32 dstip)
 
 	/* FTP data connection process */
 	/* Add your code here */
+	 if (ftp_data_mode && ftp_data_cmd == FTP_DATA_CMD_RETR) {
+        __u16 sport = ntohs(tcph->source);
+        __u16 dport = ntohs(tcph->dest);
+        
+        // 创建新会话
+        if (tcph->syn && !current_session) {
+            if (sport == ftp_data_listen_port || dport == ftp_data_listen_port) {
+                current_session = create_tcp_session(srcip, sport, dstip, dport);
+                if (current_session) {
+                    current_session->syn_received = 1;
+                    current_session->next_seq = ntohl(tcph->seq) + 1;
+                }
+            }
+            return;
+        }
 
+        // 处理数据包
+        if (current_session) {
+            __u32 seq = ntohl(tcph->seq);
+            __u32 payload_len = pkt_len - tcph->doff * 4;
+            
+            if (payload_len > 0) {
+                insert_tcp_segment(current_session, seq, 
+                                 tcp_pkt + tcph->doff * 4, payload_len);
+            }
+
+            // 检查会话结束
+            if (tcph->fin) {
+                current_session->fin_received = 1;
+                if (current_session->fp) {
+                    fclose(current_session->fp);
+                    current_session->fp = NULL;
+                }
+                free(current_session);
+                current_session = NULL;
+            }
+        }
+    }
 	return;
 };
 
