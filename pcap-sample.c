@@ -15,7 +15,7 @@
 //#define _DBG_PKT
 //#define _DBG_ETH
 //#define _DBG_IP
-#define _DBG_TCP
+//#define _DBG_TCP
 #define _DBG_FTP_CTRL
 
 #define FTP_CMD_PORT	"PORT "
@@ -57,7 +57,7 @@ static __u32 ftp_data_mode = 0;
 static __u32 ftp_data_listen_ip = 0;
 static __u16 ftp_data_listen_port = 0;
 static TcpSession *current_session = NULL;
-
+static filecounter=0;
 TcpSession *create_tcp_session(__u32 cip, __u16 cport, __u32 sip, __u16 sport) {
     TcpSession *session = (TcpSession *)malloc(sizeof(TcpSession));
     if (!session) return NULL;
@@ -67,7 +67,9 @@ TcpSession *create_tcp_session(__u32 cip, __u16 cport, __u32 sip, __u16 sport) {
     session->client_port = cport;
     session->server_ip = sip;
     session->server_port = sport;
-    session->fp = fopen("cstest.txt", "wb");
+	char filename[256];
+	sprintf(filename, "ftp_data_%d.orig", filecounter++);
+    session->fp = fopen(filename, "wb");
     
     return session;
 }
@@ -75,9 +77,14 @@ TcpSession *create_tcp_session(__u32 cip, __u16 cport, __u32 sip, __u16 sport) {
 void insert_tcp_segment(TcpSession *session, __u32 seq, const u_char *data, __u32 len) {
     if (!session || !data || !len) return;
     // 如果是期望的下一个序列号，直接写入文件
+	printf("expect seq is %d\n",session->next_seq);
     if (seq == session->next_seq) {
         fwrite(data, 1, len, session->fp);
+		if (fflush(current_session->fp) != 0) {
+    		DBG("Flush failed: %s\n", strerror(errno));
+		}
         session->next_seq = seq + len;
+		printf("Writing %u bytes at seq %u\n", len, seq);
         return;
     }
 
@@ -102,6 +109,8 @@ void insert_tcp_segment(TcpSession *session, __u32 seq, const u_char *data, __u3
     
     seg->next = *pp;
     *pp = seg;
+	printf("Insert segment: seq=%u, len=%u, next_seq=%u\n", seq, len, session->next_seq);
+
 }
 
 //transform "a1,a2,a3,a4,a5,a6" to IP and port
@@ -220,17 +229,15 @@ void tcp_proc(const u_char * tcp_pkt, __u32 pkt_len, __u32 srcip, __u32 dstip)
 	 if (ftp_data_mode && ftp_data_cmd == FTP_DATA_CMD_RETR) {
         __u16 sport = ntohs(tcph->source);
         __u16 dport = ntohs(tcph->dest);
-        
         // 创建新会话
-        if (tcph->syn && !current_session) {
-            if (sport == ftp_data_listen_port || dport == ftp_data_listen_port) {
+        if ( !current_session&&(sport == ftp_data_listen_port || dport == ftp_data_listen_port)) {
                 current_session = create_tcp_session(srcip, sport, dstip, dport);
-                if (current_session) {
+                printf("successfully create session!\n");
+				if (current_session) {
                     current_session->syn_received = 1;
-                    current_session->next_seq = ntohl(tcph->seq) + 1;
+                    current_session->next_seq = ntohl(tcph->seq);
                 }
-            }
-            return;
+            
         }
 
         // 处理数据包
@@ -246,14 +253,25 @@ void tcp_proc(const u_char * tcp_pkt, __u32 pkt_len, __u32 srcip, __u32 dstip)
             // 检查会话结束
             if (tcph->fin) {
                 current_session->fin_received = 1;
-                if (current_session->fp) {
-                    fclose(current_session->fp);
-                    current_session->fp = NULL;
-                }
-                free(current_session);
-                current_session = NULL;
+               TcpSegment *current = current_session->head;
+				while (current) {
+					   fflush(current_session->fp);
+					if (current->seq == current_session->next_seq) {
+						fwrite(current->data, 1, current->len, current_session->fp);
+						current_session->next_seq += current->len;
+						TcpSegment *temp = current;
+						current = current->next;
+						free(temp);
+					} else {
+						break; // 遇到不连续的数据停止处理
+					}
+				}
+				fclose(current_session->fp);
+				free(current_session);
+				current_session = NULL;		
+				}
             }
-        }
+        
     }
 	return;
 };
